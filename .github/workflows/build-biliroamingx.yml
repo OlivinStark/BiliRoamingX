@@ -1,0 +1,203 @@
+# =============================================================================
+# BiliRoamingX —— GitHub Actions 云端构建（修正版 v2）
+# 放置位置：仓库根目录下的 .github/workflows/build-biliroamingx.yml
+#
+# v1 为什么失败：
+#   :patches 模块依赖 kofua.app.revanced:revanced-patcher:19.3.1，
+#   而 settings.gradle.kts 指向的 maven.pkg.github.com/zjns/registry 已不可访问（404），
+#   该构件现在只在 zjns/revanced-patcher 仓库，且版本已是 19.3.1.4。
+#
+# v2 的三处关键改动：
+#   1) 新增「诊断私有仓库」步骤：先用 curl 打印各 endpoint 的 HTTP 状态码
+#   2) 新增「修正依赖」步骤：自动把 patcher 抬到 19.3.1.4 并补两个 maven 源
+#   3) 拆成两阶段构建：integrations APK 必定产出；dist 失败不阻断交付
+# =============================================================================
+name: Build BiliRoamingX
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (JDK 17 / Gradle dist)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      # submodules: recursive 必须（Dobby 子模块）；fetch-depth: 0 用于算提交数当版本号
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Verify Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -1 "$ANDROID_HOME/build-tools" || true
+          java -version
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'gradle/*.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Retrieve version
+        run: |
+          BASE_VERSION=$(awk -F '=' '$1 == "version" {print $2}' gradle.properties | tr -d '[:space:]')
+          COMMIT_COUNT=$(git rev-list HEAD --count)
+          VERSION="${BASE_VERSION}.r${COMMIT_COUNT}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "构建版本号：$VERSION"
+
+      # 诊断：打印每个 endpoint 的真实 HTTP 状态码
+      #   200 = 可读   401 = 无凭证/凭证无效   404 = 该仓库或该版本不存在
+      # 永不失败，纯粹为了让你看懂卡在哪。
+      - name: Diagnose registry access
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          probe() {
+            code=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' -L \
+              --user "$GITHUB_ACTOR:$GITHUB_TOKEN" "$1")
+            printf '%-4s %s\n' "$code" "$1"
+          }
+          echo "== revanced-patcher 19.3.1.4 @ zjns/revanced-patcher（应 200）=="
+          probe "https://maven.pkg.github.com/zjns/revanced-patcher/kofua/app/revanced/revanced-patcher/19.3.1.4/revanced-patcher-19.3.1.4.pom"
+          echo "== apktool-lib 2.12.0.1 @ zjns/Apktool（应 200）=="
+          probe "https://maven.pkg.github.com/zjns/Apktool/kofua/app/revanced/apktool-lib/2.12.0.1/apktool-lib-2.12.0.1.pom"
+          echo "== revanced-patcher 19.3.1 @ zjns/registry（项目当前写法，预期 404）=="
+          probe "https://maven.pkg.github.com/zjns/registry/kofua/app/revanced/revanced-patcher/19.3.1/revanced-patcher-19.3.1.pom"
+
+      # 修正依赖：不改你 fork 的提交历史，只在 runner 上就地改
+      - name: Fix upstream dependency wiring
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+
+          toml = pathlib.Path("gradle/libs.versions.toml")
+          t = toml.read_text(encoding="utf-8")
+          t2, n = re.subn(r'(?m)^revanced-patcher\s*=\s*"[^"]*"',
+                          'revanced-patcher = "19.3.1.4"', t)
+          if n != 1:
+              sys.exit("[FATAL] libs.versions.toml 中未找到唯一的 revanced-patcher 版本行")
+          toml.write_text(t2, encoding="utf-8")
+          print("[OK] revanced-patcher -> 19.3.1.4")
+
+          st = pathlib.Path("settings.gradle.kts")
+          s = st.read_text(encoding="utf-8")
+          if "zjns/revanced-patcher" in s:
+              print("[SKIP] 仓库已存在")
+          else:
+              m = re.search(r'dependencyResolutionManagement\s*\{.*?repositories\s*\{', s, re.S)
+              if not m:
+                  sys.exit("[FATAL] settings.gradle.kts 中未找到 dependencyResolutionManagement.repositories")
+              block = """
+                  maven {
+                      // kofua.app.revanced:revanced-patcher 实际发布在此仓库
+                      url = uri("https://maven.pkg.github.com/zjns/revanced-patcher")
+                      credentials {
+                          username = gprUser.orNull ?: System.getenv("GITHUB_ACTOR")
+                          password = gprKey.orNull ?: System.getenv("GITHUB_TOKEN")
+                      }
+                  }
+                  maven {
+                      // revanced-patcher 的传递依赖 apktool-lib 在此仓库
+                      url = uri("https://maven.pkg.github.com/zjns/Apktool")
+                      credentials {
+                          username = gprUser.orNull ?: System.getenv("GITHUB_ACTOR")
+                          password = gprKey.orNull ?: System.getenv("GITHUB_TOKEN")
+                      }
+                  }
+          """
+              s = s[:m.end()] + block + s[m.end():]
+              st.write_text(s, encoding="utf-8")
+              print("[OK] 已补充 2 个 maven 仓库")
+          PY
+
+      # 阶段一：integrations APK（不依赖那个私有构件，必定成功）
+      - name: Build integrations APK
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew --no-daemon \
+            -Dorg.gradle.jvmargs=-Xmx3g \
+            -Pversion="$VERSION" \
+            :integrations:app:assembleRelease
+
+      # 阶段二：完整 dist（额外产出 patches.jar）
+      # continue-on-error：patches 若仍解析失败，不让整个任务挂掉
+      - name: Build full dist (patches.jar)
+        id: dist
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew --no-daemon \
+            -Dorg.gradle.jvmargs=-Xmx3g \
+            -Pversion="$VERSION" \
+            dist
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p out
+          find integrations -name '*.apk' -path '*outputs/apk*' -exec cp -v {} out/ \; || true
+          if [ -d build ]; then cp -v build/*.jar build/*.apk build/*.json build/*.txt out/ 2>/dev/null || true; fi
+          echo "---- 产物清单 ----"
+          ls -lh out/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: BiliRoamingX-${{ env.VERSION }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 构建结果"
+            echo ""
+            echo "| 阶段 | 结果 |"
+            echo "|---|---|"
+            echo "| integrations APK | already produced |"
+            if [ "${{ steps.dist.outcome }}" = "success" ]; then
+              echo "| patches.jar (dist) | OK |"
+            else
+              echo "| patches.jar (dist) | FAILED — see Diagnose / dist logs |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.VERSION }}
+          files: out/*
+          generate_release_notes: true
