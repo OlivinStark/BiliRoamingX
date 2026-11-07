@@ -1,0 +1,35 @@
+name: Build BiliRoamingX APK
+on:
+  workflow_dispatch: #手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04 # 固定ubuntu24，避开ubuntu-latest未来自动切26的警告
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6 #升级到v6，支持Node24，消除Node20警告
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v5 #升级v5，解决setup-java v4废弃警告
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Install Android NDK & CMake（BiliRoamingX必须！）
+        run: |
+          sudo apt update
+          sudo apt install -y cmake ninja-build
+
+      - name: Gradle wrapper权限
+        run: chmod +x gradlew
+
+      - name: 构建Release包
+        run: ./gradlew assembleRelease
+        # 国内容易超时，可以加镜像：在gradle.properties配置阿里云maven镜像
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: BiliRoamingX-release-apk
+          path: app/build/outputs/apk/release/*.apk
