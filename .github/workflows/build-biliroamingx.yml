@@ -1,0 +1,149 @@
+# =============================================================================
+# BiliRoamingX —— GitHub Actions 云端构建
+# 放置位置：仓库根目录下的 .github/workflows/build-biliroamingx.yml
+# 说明：本文件基于仓库官方 .github/workflows/ci.yml 改写，增加了手动触发、
+#       显式权限声明、产物清单打印和可选 Release 发布。
+# =============================================================================
+name: Build BiliRoamingX
+
+on:
+  # 手动触发：仓库页面 Actions -> 左侧选本 workflow -> Run workflow
+  workflow_dispatch:
+
+  # 打 tag（v 开头）时自动构建并发布 Release；不需要可以整段删掉
+  push:
+    tags:
+      - 'v*'
+
+# 说明：
+#   contents: read   —— checkout 代码
+#   packages: read   —— settings.gradle.kts 里有一个 maven.pkg.github.com 源需要 token 认证
+#   contents: write  —— 仅「发布 Release」那一步需要，不需要 Release 可降级为 read
+permissions:
+  contents: write
+  packages: read
+
+# 同一分支重复触发时取消旧任务，避免浪费额度
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (JDK 17 / Gradle dist)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. 拉代码
+      #    ⚠️ submodules: recursive 必须加：integrations/libs/Dobby 是 LSPosed/Dobby
+      #    子模块（C++ 库），缺了它 NDK 编译阶段会直接失败。
+      #    fetch-depth: 0 必须加：版本号用 git rev-list HEAD --count 计算提交数。
+      # ---------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      # ---------------------------------------------------------------------
+      # 2. JDK 17
+      #    主工程 toolchain = 17；patches 模块 toolchain = 11，
+      #    ubuntu 运行器自带 11（缺失时 foojay 插件会自动下载，无需额外配置）。
+      # ---------------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # ---------------------------------------------------------------------
+      # 3. 自检 Android SDK（编译失败时看这一步的输出定位问题）
+      #    patches:buildDexJar 会用 $ANDROID_HOME/build-tools/<最新>/d8 生成 classes.dex
+      # ---------------------------------------------------------------------
+      - name: Verify Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls -1 "$ANDROID_HOME/build-tools" || true
+          ls -1 "$ANDROID_HOME/ndk" || echo "NDK 未预装，AGP 会自动下载（需要数分钟）"
+          java -version
+
+      # ---------------------------------------------------------------------
+      # 4. 缓存 Gradle（第二次构建通常从 6~8 分钟降到 1~2 分钟）
+      # ---------------------------------------------------------------------
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'gradle/*.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ---------------------------------------------------------------------
+      # 5. 计算版本号
+      #    基础版本取 gradle.properties 的 version（当前 1.23.3），
+      #    再拼上提交数，得到形如 1.23.3.r1284。
+      #    ⚠️ 必须是「三段 + .r数字」结构：app 模块用 split('.') 解构算 versionCode，
+      #       前三段必须都是纯数字。
+      # ---------------------------------------------------------------------
+      - name: Retrieve version
+        run: |
+          BASE_VERSION=$(awk -F '=' '$1 == "version" {print $2}' gradle.properties | tr -d '[:space:]')
+          COMMIT_COUNT=$(git rev-list HEAD --count)
+          VERSION="${BASE_VERSION}.r${COMMIT_COUNT}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "构建版本号：$VERSION"
+
+      # ---------------------------------------------------------------------
+      # 6. 正式构建
+      #    dist 是根工程注册的 Sync 任务，依赖：
+      #      :integrations:app:assembleRelease  -> release APK（debug 签名 + R8）
+      #      :patches:dist                     -> patches jar（内含 classes.dex）
+      #    产物统一汇总到根目录 build/
+      #    GITHUB_TOKEN 用于读取 maven.pkg.github.com 源。
+      # ---------------------------------------------------------------------
+      - name: Build with Gradle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew --no-daemon \
+            -Dorg.gradle.jvmargs=-Xmx3g \
+            -Pversion="$VERSION" \
+            dist
+
+      # ---------------------------------------------------------------------
+      # 7. 打印产物清单（方便在日志里确认文件名）
+      # ---------------------------------------------------------------------
+      - name: List artifacts
+        run: ls -lh build/
+
+      # ---------------------------------------------------------------------
+      # 8. 上传构建产物（Actions 页面底部 Artifacts 区可下载）
+      # ---------------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliRoamingX-${{ env.VERSION }}
+          path: build/
+          retention-days: 14
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------------
+      # 9. 可选：打 tag 时创建 Release 并附上产物
+      #    不需要自动发布可以删掉这一步（并把 permissions.contents 改回 read）
+      # ---------------------------------------------------------------------
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.VERSION }}
+          files: |
+            build/*.apk
+            build/*.jar
+            build/patches.json
+            build/mapping.txt
+          generate_release_notes: true
